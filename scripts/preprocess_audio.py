@@ -1,108 +1,147 @@
-import librosa
-import numpy as np
-from moviepy.editor import VideoFileClip
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR, LambdaLR
+from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import GradScaler, autocast
+from models.ensemble import EnsembleModel
+from utils.data_loader import load_data
+from tqdm import tqdm
 import os
-import pandas as pd
+import argparse
+from sklearn.metrics import precision_score, recall_score, f1_score
 
-def extract_audio(video_path, output_audio_path):
-    """Extract audio from a video and save it as a WAV file."""
-    try:
-        # Check if the video file exists
-        if not os.path.exists(video_path):
-            print(f"Error: Video file {video_path} not found.")
-            return False
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-        # Load the video file
-        video = VideoFileClip(video_path)
-        if video.audio is None:
-            print(f"Warning: No audio stream found in {video_path}. Skipping audio extraction.")
-            return False  # No audio stream, skip extraction
+# Parse command-line arguments
+parser = argparse.ArgumentParser()
+parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
+args = parser.parse_args()
 
-        # Extract and save the audio
-        video.audio.write_audiofile(output_audio_path, logger=None)  # Disable logging for cleaner output
-        print(f"Extracted audio from {video_path} to {output_audio_path}.")
-        return True
-    except Exception as e:
-        print(f"Error extracting audio from {video_path}: {e}")
-        return False
+# Initialize TensorBoard writer
+writer = SummaryWriter("runs/experiment_name")
 
-def segment_audio(audio_path, segment_length=5):
-    """Segment audio into smaller chunks of a specified length (in seconds)."""
-    try:
-        y, sr = librosa.load(audio_path, sr=None)
-        segments = []
-        for i in range(0, len(y), sr * segment_length):
-            segment = y[i:i + sr * segment_length]
-            segments.append(segment)
-        return segments, sr
-    except Exception as e:
-        print(f"Error segmenting audio from {audio_path}: {e}")
-        return None, None
+# Load data
+train_loader, test_loader = load_data(batch_size=args.batch_size)
 
-def extract_audio_features(audio_segment, sr):
-    """Extract MFCC features from an audio segment."""
-    try:
-        mfccs = librosa.feature.mfcc(y=audio_segment, sr=sr, n_mfcc=13)
-        return mfccs
-    except Exception as e:
-        print(f"Error extracting features from audio segment: {e}")
-        return None
+# Initialize model
+model = EnsembleModel(audio_input_size=13, video_input_size=256, hidden_size=128, num_classes=2).to(device)
 
-if __name__ == "__main__":
-    # Load metadata
-    metadata_file = "data/dataset.csv"
-    if not os.path.exists(metadata_file):
-        sys.exit(f"Error: Metadata file {metadata_file} not found. Exiting.")
+# Loss and optimizer
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    metadata = pd.read_csv(metadata_file)
+# Learning rate scheduler
+scheduler = StepLR(optimizer, step_size=5, gamma=0.1)  # Reduce learning rate every 5 epochs
 
-    # Create output folders
-    audio_folder = "data/audio"
-    features_folder = "data/audio_features"
-    os.makedirs(audio_folder, exist_ok=True)
-    os.makedirs(features_folder, exist_ok=True)
+# Mixed precision training
+scaler = GradScaler()
 
-    # Process each video
-    for index, row in metadata.iterrows():
-        video_path = row["video_path"]
-        label = row["label"]
+# Save the best model
+best_val_loss = float('inf')
+best_model_path = "models/best_model.pth"
+os.makedirs("models", exist_ok=True)
 
-        # Skip if the video file doesn't exist
-        if not os.path.exists(video_path):
-            print(f"Warning: Video {video_path} not found. Skipping.")
-            continue
+# Early stopping
+early_stopping_patience = 3  # Stop if validation loss does not improve for 3 epochs
+early_stopping_counter = 0
 
-        # Extract audio (if available)
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-        audio_path = os.path.join(audio_folder, f"{video_name}.wav")
+# Training loop
+for epoch in range(args.epochs):
+    model.train()  # Set model to training mode
+    train_loss = 0.0
+    progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
 
-        # Check if the video has an audio stream
-        has_audio = extract_audio(video_path, audio_path)
+    for audio_input, video_input, labels in progress_bar:
+        # Move data to device
+        audio_input = audio_input.to(device)
+        video_input = video_input.to(device)
+        labels = labels.to(device)
 
-        # If the video has no audio, skip audio processing
-        if not has_audio:
-            print(f"Warning: No audio stream found in {video_path}. Skipping audio processing.")
-            continue
+        # Forward pass with mixed precision
+        with autocast():
+            outputs = model(audio_input, video_input)
+            loss = criterion(outputs, labels)
 
-        # Segment audio
-        segments, sr = segment_audio(audio_path)
-        if not segments:
-            print(f"Warning: Audio segmentation failed for {audio_path}. Skipping.")
-            continue
+        # Backward pass and optimization
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-        # Extract audio features
-        features = []
-        for segment in segments:
-            mfccs = extract_audio_features(segment, sr)
-            if mfccs is not None:
-                features.append(mfccs)
+        # Update training loss
+        train_loss += loss.item()
 
-        # Skip if no features were extracted
-        if not features:
-            print(f"Warning: No features extracted for {audio_path}. Skipping.")
-            continue
+        # Update progress bar
+        progress_bar.set_postfix({"Loss": loss.item()})
 
-        # Save features
-        features_path = os.path.join(features_folder, f"{video_name}_features.npy")
-        np.save(features_path, np.array(features))
-        print(f"Saved audio features for {video_path} to {features_path}.")
+    # Log training loss
+    writer.add_scalar("Training Loss", train_loss / len(train_loader), epoch)
+
+    # Validation loop
+    model.eval()  # Set model to evaluation mode
+    val_loss = 0.0
+    correct = 0
+    total = 0
+    all_labels = []
+    all_predicted = []
+
+    with torch.no_grad():
+        for audio_input, video_input, labels in test_loader:
+            # Move data to device
+            audio_input = audio_input.to(device)
+            video_input = video_input.to(device)
+            labels = labels.to(device)
+
+            # Forward pass
+            outputs = model(audio_input, video_input)
+            loss = criterion(outputs, labels)
+
+            # Update validation loss
+            val_loss += loss.item()
+
+            # Calculate accuracy
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            all_labels.extend(labels.cpu().numpy())
+            all_predicted.extend(predicted.cpu().numpy())
+
+    # Log validation metrics
+    val_loss /= len(test_loader)
+    val_accuracy = 100 * correct / total
+    precision = precision_score(all_labels, all_predicted, average='binary')
+    recall = recall_score(all_labels, all_predicted, average='binary')
+    f1 = f1_score(all_labels, all_predicted, average='binary')
+    writer.add_scalar("Validation Loss", val_loss, epoch)
+    writer.add_scalar("Validation Accuracy", val_accuracy, epoch)
+    writer.add_scalar("Precision", precision, epoch)
+    writer.add_scalar("Recall", recall, epoch)
+    writer.add_scalar("F1-Score", f1, epoch)
+
+    print(f"Epoch [{epoch+1}/{args.epochs}], Training Loss: {train_loss / len(train_loader):.4f}, "
+          f"Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_accuracy:.2f}%, "
+          f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1-Score: {f1:.4f}")
+
+    # Save the best model
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), best_model_path)
+        print(f"Saved best model with validation loss: {val_loss:.4f}")
+        early_stopping_counter = 0  # Reset early stopping counter
+    else:
+        early_stopping_counter += 1
+
+    # Early stopping
+    if early_stopping_counter >= early_stopping_patience:
+        print(f"Early stopping at epoch {epoch+1}.")
+        break
+
+    # Update learning rate
+    scheduler.step()
+
+print("Training complete. Best model saved to:", best_model_path)

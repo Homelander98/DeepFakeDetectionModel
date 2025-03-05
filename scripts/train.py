@@ -1,3 +1,9 @@
+import sys
+import os
+
+# Add the project root directory to the Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -5,8 +11,6 @@ from torch.optim.lr_scheduler import StepLR
 from models.ensemble import EnsembleModel
 from utils.data_loader import load_data
 from tqdm import tqdm
-import os
-import sys
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -46,6 +50,14 @@ for epoch in range(10):
         video_input = video_input.to(device)
         labels = labels.to(device)
 
+        # Ensure audio_input has 3 dimensions: (batch_size, sequence_length=1, input_size)
+        if audio_input.dim() == 2:
+            audio_input = audio_input.unsqueeze(1)
+
+        # Print input shapes for debugging
+        print("Audio input shape:", audio_input.shape)
+        print("Video input shape:", video_input.shape)
+
         # Forward pass
         outputs = model(audio_input, video_input)
         loss = criterion(outputs, labels)
@@ -77,6 +89,14 @@ for epoch in range(10):
             audio_input = audio_input.to(device)
             video_input = video_input.to(device)
             labels = labels.to(device)
+
+            # Ensure audio_input has 3 dimensions: (batch_size, sequence_length=1, input_size)
+            if audio_input.dim() == 2:
+                audio_input = audio_input.unsqueeze(1)
+
+            # Ensure video_input has 3 dimensions: (batch_size, sequence_length=1, input_size)
+            if video_input.dim() == 2:
+                video_input = video_input.unsqueeze(1)
 
             # Forward pass
             outputs = model(audio_input, video_input)
@@ -113,4 +133,3 @@ for epoch in range(10):
     scheduler.step()
 
 print("Training complete. Best model saved to:", best_model_path)
-
